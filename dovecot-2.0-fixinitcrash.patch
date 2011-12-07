@@ -1,0 +1,435 @@
+diff -up dovecot-2.0.beta6/configure.in.fixinitcrash dovecot-2.0.beta6/configure.in
+--- dovecot-2.0.beta6/configure.in.fixinitcrash	2010-06-30 04:00:03.000000000 +0200
++++ dovecot-2.0.beta6/configure.in	2010-07-19 10:39:59.821701829 +0200
+@@ -1293,6 +1293,9 @@ esac
+ if test $i_cv_fd_passing = buggy_cmsg_macros; then
+   AC_DEFINE(BUGGY_CMSG_MACROS,, Define if you have buggy CMSG macros)
+ fi
++if test $i_cv_fd_passing = no; then
++  AC_ERROR([fd passing is required for Dovecot to work])
++fi
+ 
+ dnl * Solaris compatible sendfile()
+ AC_CHECK_LIB(sendfile, sendfile, [
+diff -up dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/plugins/mailbox/tag-mailbox-create.c.fixinitcrash dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/plugins/mailbox/tag-mailbox-create.c
+--- dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/plugins/mailbox/tag-mailbox-create.c.fixinitcrash	2010-06-26 00:51:33.000000000 +0200
++++ dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/plugins/mailbox/tag-mailbox-create.c	2010-07-19 10:39:59.814701871 +0200
+@@ -125,7 +125,7 @@ static bool seff_mailbox_create_pre_exec
+ 	enum mail_error error;
+ 	
+ 	/* Check whether creation is necessary */
+-	if ( trans->box == NULL || trans->redundant || trans->disabled )
++	if ( trans->box == NULL || trans->disabled )
+ 		return TRUE;
+ 
+ 	/* Check whether creation has a chance of working */
+@@ -133,6 +133,10 @@ static bool seff_mailbox_create_pre_exec
+ 		trans->error_code != MAIL_ERROR_NOTFOUND )
+ 		return FALSE;
+ 
++	trans->error = NULL;
++	trans->error_code = MAIL_ERROR_NONE;
++	
++
+ 	*storage = mailbox_get_storage(trans->box);
+ 
+ 	/* Create mailbox */
+@@ -143,6 +147,7 @@ static bool seff_mailbox_create_pre_exec
+ 			return FALSE;
+ 		}
+ 	}
++
+ 	/* Subscribe to it if necessary */
+ 	if ( aenv->scriptenv->mailbox_autosubscribe ) {
+ 		(void)mailbox_list_set_subscribed
+diff -up dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/sieve-actions.c.fixinitcrash dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/sieve-actions.c
+--- dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/sieve-actions.c.fixinitcrash	2010-06-26 00:51:33.000000000 +0200
++++ dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/src/lib-sieve/sieve-actions.c	2010-07-19 10:39:59.826886912 +0200
+@@ -331,19 +331,18 @@ static void act_store_print
+ /* Action implementation */
+ 
+ static bool act_store_mailbox_open
+-(const struct sieve_action_exec_env *aenv, const char **mailbox,
+- struct mailbox **box_r, const char **error_r)
++(const struct sieve_action_exec_env *aenv, const char *mailbox,
++	struct mailbox **box_r, enum mail_error *error_code_r, const char **error_r)
+ {
+ 	struct mail_storage **storage = &(aenv->exec_status->last_storage);
+ 	struct mail_deliver_save_open_context save_ctx;
+-	const char *error;
+ 
+ 	*box_r = NULL;
+ 
+-	if ( !uni_utf8_str_is_valid(*mailbox) ) {
++	if ( !uni_utf8_str_is_valid(mailbox) ) {
+ 		/* FIXME: check utf-8 validity at compiletime/runtime */
+-		*error_r = t_strdup_printf("mailbox name not utf-8: %s",
+-					   *mailbox);
++		*error_r = t_strdup_printf("mailbox name not utf-8: %s", mailbox);
++		*error_code_r = MAIL_ERROR_PARAMS;
+ 		return FALSE;
+ 	}
+ 
+@@ -352,15 +351,9 @@ static bool act_store_mailbox_open
+ 	save_ctx.lda_mailbox_autocreate = aenv->scriptenv->mailbox_autocreate;
+ 	save_ctx.lda_mailbox_autosubscribe = aenv->scriptenv->mailbox_autosubscribe;
+ 
+-	if (mail_deliver_save_open(&save_ctx, *mailbox, box_r, &error) < 0) {
+-		*error_r = t_strdup_printf("failed to save mail to mailbox '%s': %s",
+-					   *mailbox, error);
++	if (mail_deliver_save_open(&save_ctx, mailbox, box_r, error_code_r, error_r) < 0)
+ 		return FALSE;
+-	}
+ 
+-	/* FIXME: is box freed too early for this? is it even useful to update
+-	   this name now that box is set? */
+-	*mailbox = mailbox_get_vname(*box_r);
+ 	*storage = mailbox_get_storage(*box_r);
+ 	return TRUE;
+ }
+@@ -371,12 +364,12 @@ static bool act_store_start
+ {  
+ 	struct act_store_context *ctx = (struct act_store_context *) action->context;
+ 	const struct sieve_script_env *senv = aenv->scriptenv;
+-	const struct sieve_message_data *msgdata = aenv->msgdata;
+ 	struct act_store_transaction *trans;
+ 	struct mailbox *box = NULL;
+ 	pool_t pool = sieve_result_pool(aenv->result);
+ 	const char *error = NULL;
+-	bool disabled = FALSE, redundant = FALSE, open_failed = FALSE;
++	enum mail_error error_code = MAIL_ERROR_NONE;
++	bool disabled = FALSE, open_failed = FALSE;
+ 
+ 	/* If context is NULL, the store action is the result of (implicit) keep */	
+ 	if ( ctx == NULL ) {
+@@ -390,16 +383,8 @@ static bool act_store_start
+ 	 * to NULL. This implementation will then skip actually storing the message.
+ 	 */
+ 	if ( senv->user != NULL ) {
+-		if ( !act_store_mailbox_open(aenv, &ctx->mailbox, &box, &error) ) {
++		if ( !act_store_mailbox_open(aenv, ctx->mailbox, &box, &error_code, &error) ) {
+ 			open_failed = TRUE;
+-
+-		/* Check whether we are trying to store the message in the folder it
+-		 * originates from. In that case we skip actually storing it.
+-		 */
+-		} else if ( mailbox_backends_equal(box, msgdata->mail->box) ) {
+-			mailbox_free(&box);
+-			box = NULL;
+-			redundant = TRUE;
+ 		}
+ 	} else {
+ 		disabled = TRUE;
+@@ -413,11 +398,13 @@ static bool act_store_start
+ 	trans->flags = 0;
+ 
+ 	trans->disabled = disabled;
+-	trans->redundant = redundant;
+-	trans->error_code = MAIL_ERROR_NONE;
+ 
+-	if ( open_failed && error != NULL )
+-		trans->error = p_strdup(sieve_result_pool(aenv->result), error);
++	if ( open_failed  ) {
++		trans->error = error;
++		trans->error_code = error_code;
++	} else {
++		trans->error_code = MAIL_ERROR_NONE;
++	}
+ 
+ 	*tr_context = (void *)trans;
+ 
+@@ -464,10 +451,16 @@ static bool act_store_execute
+ 	/* Check whether we need to do anything */
+ 	if ( trans->disabled ) return TRUE;
+ 
++	/* Exit early if mailbox is not available */
++	if ( trans->box == NULL || trans->error_code != MAIL_ERROR_NONE ) 
++		return FALSE;
++
+ 	/* If the message originates from the target mailbox, only update the flags 
+ 	 * and keywords 
+ 	 */
+-	if ( trans->redundant ) {
++	if ( mailbox_backends_equal(trans->box, msgdata->mail->box) ) {
++		trans->redundant = TRUE;
++
+ 		if ( trans->flags_altered ) {
+ 			keywords = act_store_keywords_create
+ 				(aenv, &trans->keywords, msgdata->mail->box);
+@@ -483,10 +476,6 @@ static bool act_store_execute
+ 		return TRUE;
+ 	}
+ 
+-	/* Exit early if mailbox is not available */
+-	if ( trans->box == NULL ) 
+-		return FALSE;
+-
+ 	/* Mark attempt to store in default mailbox */
+ 	if ( strcmp(trans->context->mailbox, 
+ 		SIEVE_SCRIPT_DEFAULT_MAILBOX(aenv->scriptenv)) == 0 ) 
+@@ -529,12 +518,15 @@ static bool act_store_execute
+ }
+ 
+ static void act_store_log_status
+-(struct act_store_transaction *trans, 
+-	const struct sieve_action_exec_env *aenv, bool rolled_back, bool status )
++(struct act_store_transaction *trans, const struct sieve_action_exec_env *aenv,
++	bool rolled_back, bool status )
+ {
+ 	const char *mailbox_name;
+-	
+-	mailbox_name = str_sanitize(trans->context->mailbox, 128);
++
++	if ( trans->box != NULL )
++		mailbox_name = str_sanitize(mailbox_get_vname(trans->box), 128);
++	else
++		mailbox_name = str_sanitize(trans->context->mailbox, 128);
+ 
+ 	/* Store disabled? */
+ 	if ( trans->disabled ) {
+diff -up dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors/fileinto.sieve.fixinitcrash dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors/fileinto.sieve
+--- dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors/fileinto.sieve.fixinitcrash	2010-07-19 10:39:59.815826608 +0200
++++ dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors/fileinto.sieve	2010-07-19 10:39:59.815826608 +0200
+@@ -0,0 +1,3 @@
++require "fileinto";
++
++fileinto "FROP";
+diff -up dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors.svtest.fixinitcrash dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors.svtest
+--- dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors.svtest.fixinitcrash	2010-06-26 00:51:33.000000000 +0200
++++ dovecot-2.0.beta6/dovecot-2-0-pigeonhole-1def8519d775/tests/execute/errors.svtest	2010-07-19 10:39:59.815826608 +0200
+@@ -80,3 +80,27 @@ test "Redirect limit" {
+ 		test_fail "unexpected error reported";
+ 	}
+ }
++
++test "Fileinto missing folder" {
++	if not test_script_compile "errors/fileinto.sieve" {
++		test_fail "compile failed";
++	}
++
++	test_mailbox :create "INBOX";
++
++	if not test_script_run {
++		test_fail "execution failed";
++	}
++
++    if test_result_execute {
++        test_fail "execution of result should have failed";
++    }	
++
++	if test_error :count "gt" :comparator "i;ascii-numeric" "1" {
++		test_fail "too many runtime errors reported";
++	}
++	
++/*	if not test_error :index 1 :contains "number of redirect actions exceeds policy limit"{
++		test_fail "unexpected error reported";
++	}*/
++}
+diff -up dovecot-2.0.beta6/src/auth/auth-worker-server.c.fixinitcrash dovecot-2.0.beta6/src/auth/auth-worker-server.c
+--- dovecot-2.0.beta6/src/auth/auth-worker-server.c.fixinitcrash	2010-04-07 04:00:04.000000000 +0200
++++ dovecot-2.0.beta6/src/auth/auth-worker-server.c	2010-07-19 10:39:59.822886297 +0200
+@@ -199,7 +199,8 @@ static void auth_worker_destroy(struct a
+ 				conn->request->context);
+ 	}
+ 
+-	io_remove(&conn->io);
++	if (conn->io != NULL)
++		io_remove(&conn->io);
+ 	i_stream_destroy(&conn->input);
+ 	o_stream_destroy(&conn->output);
+ 	timeout_remove(&conn->to);
+@@ -237,6 +238,7 @@ static void auth_worker_request_handle(s
+ {
+ 	if (strncmp(line, "*\t", 2) == 0) {
+ 		/* multi-line reply, not finished yet */
++		timeout_reset(conn->to);
+ 	} else {
+ 		conn->request = NULL;
+ 		timeout_remove(&conn->to);
+diff -up dovecot-2.0.beta6/src/lib/fdpass.c.fixinitcrash dovecot-2.0.beta6/src/lib/fdpass.c
+--- dovecot-2.0.beta6/src/lib/fdpass.c.fixinitcrash	2010-03-27 04:00:03.000000000 +0100
++++ dovecot-2.0.beta6/src/lib/fdpass.c	2010-07-19 10:39:59.822886297 +0200
+@@ -39,6 +39,13 @@
+ 
+ #include "fdpass.h"
+ 
++#ifndef HAVE_CONFIG_H
++struct const_iovec {
++	const void *iov_base;
++	size_t iov_len;
++};
++#endif
++
+ /* RFC 2292 defines CMSG_*() macros, but some operating systems don't have them
+    so we'll define our own if they don't exist.
+ 
+diff -up dovecot-2.0.beta6/src/lib-index/mail-index-transaction-finish.c.fixinitcrash dovecot-2.0.beta6/src/lib-index/mail-index-transaction-finish.c
+--- dovecot-2.0.beta6/src/lib-index/mail-index-transaction-finish.c.fixinitcrash	2010-03-26 15:16:35.000000000 +0100
++++ dovecot-2.0.beta6/src/lib-index/mail-index-transaction-finish.c	2010-07-19 10:39:59.816885985 +0200
+@@ -115,7 +115,7 @@ mail_index_transaction_finish_flag_updat
+ 	ARRAY_TYPE(seq_range) keeps;
+ 	uint32_t seq;
+ 
+-	if (!t->drop_unnecessary_flag_updates)
++	if (!t->drop_unnecessary_flag_updates || !array_is_created(&t->updates))
+ 		return;
+ 
+ 	t_array_init(&keeps, 64);
+diff -up dovecot-2.0.beta6/src/lib-lda/mail-deliver.c.fixinitcrash dovecot-2.0.beta6/src/lib-lda/mail-deliver.c
+--- dovecot-2.0.beta6/src/lib-lda/mail-deliver.c.fixinitcrash	2010-06-26 04:00:03.000000000 +0200
++++ dovecot-2.0.beta6/src/lib-lda/mail-deliver.c	2010-07-19 10:39:59.825886143 +0200
+@@ -95,23 +95,24 @@ static const char *mailbox_name_to_mutf7
+ 
+ int mail_deliver_save_open(struct mail_deliver_save_open_context *ctx,
+ 			   const char *name, struct mailbox **box_r,
+-			   const char **error_r)
++			   enum mail_error *error_r, const char **error_str_r)
+ {
+ 	struct mail_namespace *ns;
+ 	struct mail_storage *storage;
+ 	struct mailbox *box;
+-	enum mail_error error;
+ 	enum mailbox_flags flags =
+ 		MAILBOX_FLAG_KEEP_RECENT | MAILBOX_FLAG_SAVEONLY |
+ 		MAILBOX_FLAG_POST_SESSION;
+ 
+ 	*box_r = NULL;
+-	*error_r = NULL;
++	*error_r = MAIL_ERROR_NONE;
++	*error_str_r = NULL;
+ 
+ 	name = mailbox_name_to_mutf7(name);
+ 	ns = mail_namespace_find(ctx->user->namespaces, &name);
+ 	if (ns == NULL) {
+-		*error_r = "Unknown namespace";
++		*error_str_r = "Unknown namespace";
++		*error_r = MAIL_ERROR_PARAMS;
+ 		return -1;
+ 	}
+ 
+@@ -133,14 +134,14 @@ int mail_deliver_save_open(struct mail_d
+ 		return 0;
+ 
+ 	storage = mailbox_get_storage(box);
+-	*error_r = mail_storage_get_last_error(storage, &error);
+-	if (!ctx->lda_mailbox_autocreate || error != MAIL_ERROR_NOTFOUND)
++	*error_str_r = mail_storage_get_last_error(storage, error_r);
++	if (!ctx->lda_mailbox_autocreate || *error_r != MAIL_ERROR_NOTFOUND)
+ 		return -1;
+ 
+ 	/* try creating it. */
+ 	if (mailbox_create(box, NULL, FALSE) < 0) {
+-		*error_r = mail_storage_get_last_error(storage, &error);
+-		if (error != MAIL_ERROR_EXISTS)
++		*error_str_r = mail_storage_get_last_error(storage, error_r);
++		if (*error_r != MAIL_ERROR_EXISTS)
+ 			return -1;
+ 		/* someone else just created it */
+ 	}
+@@ -151,7 +152,7 @@ int mail_deliver_save_open(struct mail_d
+ 
+ 	/* and try opening again */
+ 	if (mailbox_sync(box, 0) < 0) {
+-		*error_r = mail_storage_get_last_error(storage, &error);
++		*error_str_r = mail_storage_get_last_error(storage, error_r);
+ 		return -1;
+ 	}
+ 	return 0;
+@@ -186,7 +187,8 @@ int mail_deliver_save(struct mail_delive
+ 	open_ctx.lda_mailbox_autosubscribe = ctx->set->lda_mailbox_autosubscribe;
+ 
+ 	mailbox_name = str_sanitize(mailbox, 80);
+-	if (mail_deliver_save_open(&open_ctx, mailbox, &box, &errstr) < 0) {
++	if (mail_deliver_save_open(&open_ctx, mailbox, &box,
++				   &error, &errstr) < 0) {
+ 		if (box != NULL)
+ 			mailbox_free(&box);
+ 		mail_deliver_log(ctx, "save failed to %s: %s",
+diff -up dovecot-2.0.beta6/src/lib-lda/mail-deliver.h.fixinitcrash dovecot-2.0.beta6/src/lib-lda/mail-deliver.h
+--- dovecot-2.0.beta6/src/lib-lda/mail-deliver.h.fixinitcrash	2010-06-26 04:00:03.000000000 +0200
++++ dovecot-2.0.beta6/src/lib-lda/mail-deliver.h	2010-07-19 10:39:59.826886912 +0200
+@@ -2,6 +2,7 @@
+ #define MAIL_DELIVER_H
+ 
+ enum mail_flags;
++enum mail_error;
+ struct mail_storage;
+ struct mailbox;
+ 
+@@ -60,7 +61,7 @@ const char *mail_deliver_get_new_message
+    be returned even with -1, and the caller must free it then. */
+ int mail_deliver_save_open(struct mail_deliver_save_open_context *ctx,
+ 			   const char *name, struct mailbox **box_r,
+-			   const char **error_r);
++			   enum mail_error *error_r, const char **error_str_r);
+ int mail_deliver_save(struct mail_deliver_context *ctx, const char *mailbox,
+ 		      enum mail_flags flags, const char *const *keywords,
+ 		      struct mail_storage **storage_r);
+diff -up dovecot-2.0.beta6/src/lib-settings/settings-parser.c.fixinitcrash dovecot-2.0.beta6/src/lib-settings/settings-parser.c
+--- dovecot-2.0.beta6/src/lib-settings/settings-parser.c.fixinitcrash	2010-06-25 17:22:16.000000000 +0200
++++ dovecot-2.0.beta6/src/lib-settings/settings-parser.c	2010-07-19 10:39:59.820886174 +0200
+@@ -753,6 +753,10 @@ const char *settings_parse_unalias(struc
+ 
+ 	if (!settings_find_key(ctx, key, &def, &link))
+ 		return NULL;
++	if (def == NULL) {
++		/* strlist */
++		return key;
++	}
+ 
+ 	while (def->type == SET_ALIAS) {
+ 		i_assert(def != link->info->defines);
+@@ -1460,7 +1464,7 @@ info_update_real(pool_t pool, struct set
+ 	/* add existing defines */
+ 	for (j = 0; parent->defines[j].key != NULL; j++)
+ 		array_append(&defines, &parent->defines[j], 1);
+-	new_struct_size = parent->struct_size;
++	new_struct_size = MEM_ALIGN(parent->struct_size);
+ 
+ 	/* add new dynamic defines */
+ 	for (i = 0; parsers[i].name != NULL; i++) {
+@@ -1482,7 +1486,7 @@ info_update_real(pool_t pool, struct set
+ 	/* update defaults */
+ 	parent_defaults = p_malloc(pool, new_struct_size);
+ 	memcpy(parent_defaults, parent->defaults, parent->struct_size);
+-	offset = parent->struct_size;
++	offset = MEM_ALIGN(parent->struct_size);
+ 	for (i = 0; parsers[i].name != NULL; i++) {
+ 		memcpy(PTR_OFFSET(parent_defaults, offset),
+ 		       parsers[i].info->defaults, parsers[i].info->struct_size);
+@@ -1498,7 +1502,7 @@ info_update_real(pool_t pool, struct set
+ 				     &parent->dynamic_parsers[i], 1);
+ 		}
+ 	}
+-	offset = parent->struct_size;
++	offset = MEM_ALIGN(parent->struct_size);
+ 	for (i = 0; parsers[i].name != NULL; i++) {
+ 		new_parser = parsers[i];
+ 		new_parser.name = p_strdup(pool, new_parser.name);
+diff -up dovecot-2.0.beta6/src/lib-storage/mail-search-register-imap.c.fixinitcrash dovecot-2.0.beta6/src/lib-storage/mail-search-register-imap.c
+--- dovecot-2.0.beta6/src/lib-storage/mail-search-register-imap.c.fixinitcrash	2010-05-08 04:00:04.000000000 +0200
++++ dovecot-2.0.beta6/src/lib-storage/mail-search-register-imap.c	2010-07-19 10:39:59.817886639 +0200
+@@ -301,6 +301,9 @@ imap_search_older(struct mail_search_bui
+ 	struct mail_search_arg *sarg;
+ 
+ 	sarg = arg_new_interval(ctx, SEARCH_BEFORE);
++	if (sarg == NULL)
++		return NULL;
++
+ 	/* we need to match also equal, but SEARCH_BEFORE compares with "<" */
+ 	sarg->value.time++;
+ 	return sarg;
+diff -up dovecot-2.0.beta6/src/master/service-listen.c.fixinitcrash dovecot-2.0.beta6/src/master/service-listen.c
+--- dovecot-2.0.beta6/src/master/service-listen.c.fixinitcrash	2010-05-20 04:00:04.000000000 +0200
++++ dovecot-2.0.beta6/src/master/service-listen.c	2010-07-19 10:39:59.823886158 +0200
+@@ -117,7 +117,9 @@ static int service_fifo_listener_listen(
+ 		return -1;
+ 	}
+ 
+-	fd = open(set->path, O_RDONLY | O_NONBLOCK);
++	/* open as RDWR, so that even if the last writer closes,
++	   we won't get EOF errors */
++	fd = open(set->path, O_RDWR | O_NONBLOCK);
+ 	if (fd == -1) {
+ 		service_error(service, "open(%s) failed: %m", set->path);
+ 		return -1;

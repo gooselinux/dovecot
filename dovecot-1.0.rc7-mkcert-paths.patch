@@ -1,0 +1,13 @@
+--- dovecot-1.0.rc7/doc/mkcert.sh.mkcert-paths	2006-10-04 11:34:46.000000000 +0200
++++ dovecot-1.0.rc7/doc/mkcert.sh	2006-10-04 11:35:31.000000000 +0200
+@@ -4,8 +4,8 @@
+ # Edit dovecot-openssl.cnf before running this.
+ 
+ OPENSSL=${OPENSSL-openssl}
+-SSLDIR=${SSLDIR-/etc/ssl}
+-OPENSSLCONFIG=${OPENSSLCONFIG-dovecot-openssl.cnf}
++SSLDIR=${SSLDIR-/etc/pki/dovecot}
++OPENSSLCONFIG=${OPENSSLCONFIG-/etc/pki/dovecot/dovecot-openssl.cnf}
+ 
+ CERTDIR=$SSLDIR/certs
+ KEYDIR=$SSLDIR/private

@@ -1,0 +1,11 @@
+diff -up dovecot-2.0.beta4/doc/example-config/conf.d/10-mail.conf.defconf dovecot-2.0.beta4/doc/example-config/conf.d/10-mail.conf
+--- dovecot-2.0.beta4/doc/example-config/conf.d/10-mail.conf.defconf	2010-03-25 15:13:01.458494067 +0100
++++ dovecot-2.0.beta4/doc/example-config/conf.d/10-mail.conf	2010-03-25 15:13:01.459364459 +0100
+@@ -262,6 +262,7 @@
+ # them simultaneously.
+ #mbox_read_locks = fcntl
+ #mbox_write_locks = dotlock fcntl
++mbox_write_locks = fcntl
+ 
+ # Maximum time to wait for lock (all of them) before aborting.
+ #mbox_lock_timeout = 5 mins
